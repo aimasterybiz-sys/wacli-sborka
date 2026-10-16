@@ -186,6 +186,6 @@ jobs:
         run: |
           TAG="${{ needs.versiya.outputs.tag }}"
           gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$TAG" files/* --repo "$GITHUB_REPOSITORY" \
+          gh release create "$TAG" files/* --repo "$GITHUB_REPOSITORY" --latest \
             --title "wacli $TAG — macOS 12+ и Windows" \
             --notes "Сборка исходников https://github.com/openclaw/wacli/releases/tag/$TAG (MIT) для AI-секретаря курса Protuz. macOS 12 и новее (универсальный файл), Windows x64, Windows ARM64 (если собрался). Контрольные суммы в checksums.txt."
