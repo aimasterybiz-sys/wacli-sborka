@@ -1,0 +1,191 @@
+name: Сборка wacli для всех Mac и Windows
+
+# Собирает исходники openclaw/wacli (MIT) под macOS 12+ (Apple и Intel, универсальный файл),
+# Windows x64 и Windows ARM64. Ничего не меняет в коде: только другой минимум macOS и больше платформ.
+# Запуск: вручную с номером версии, или раз в неделю — тогда берётся последний выпуск авторов.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия wacli (тег авторов, например v0.21.0). Пусто — последний выпуск"
+        required: false
+        default: ""
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: openclaw/wacli
+
+jobs:
+  versiya:
+    name: Какую версию собирать
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      nado: ${{ steps.v.outputs.nado }}
+    steps:
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.version }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api repos/$UPSTREAM/releases/latest --jq .tag_name)
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ -z "${{ github.event.inputs.version }}" ]; then
+            echo "Версия $TAG уже собрана — пропускаю"; echo "nado=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Собираю $TAG"; echo "nado=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  mac:
+    name: macOS 12+ (универсальный)
+    needs: versiya
+    if: needs.versiya.outputs.nado == 'true'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: openclaw/wacli
+          ref: ${{ needs.versiya.outputs.tag }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Сборка arm64 и amd64
+        env:
+          CGO_ENABLED: "1"
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+          CGO_CFLAGS: "-Wno-error=missing-braces -mmacosx-version-min=12.0"
+          CGO_LDFLAGS: "-mmacosx-version-min=12.0"
+        run: |
+          V="${{ needs.versiya.outputs.tag }}"; V="${V#v}"
+          LD="-s -w -X main.version=$V -X main.releaseLinkerSetting=wacli-release-linker-version=[$V]"
+          GOARCH=arm64 go build -trimpath -tags sqlite_fts5 -ldflags "$LD" -o dist/wacli-arm64 ./cmd/wacli
+          GOARCH=amd64 go build -trimpath -tags sqlite_fts5 -ldflags "$LD" -o dist/wacli-amd64 ./cmd/wacli
+          lipo -create -output dist/wacli dist/wacli-arm64 dist/wacli-amd64
+          codesign --force --sign - dist/wacli
+          echo "--- минимальная macOS в файле:"; otool -l dist/wacli-arm64 | grep -A3 LC_BUILD_VERSION | grep minos
+          otool -l dist/wacli-amd64 | grep -A3 LC_BUILD_VERSION | grep minos
+      - name: Проверка
+        run: |
+          dist/wacli --version
+          dist/wacli --store "$RUNNER_TEMP/s" doctor
+      - name: Упаковка
+        run: |
+          V="${{ needs.versiya.outputs.tag }}"; V="${V#v}"
+          mkdir -p out && cp LICENSE README.md dist/ 2>/dev/null || true
+          tar -C dist -czf "out/wacli_${V}_darwin_universal.tar.gz" wacli LICENSE README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin
+          path: out/*
+
+  windows:
+    name: Windows x64
+    needs: versiya
+    if: needs.versiya.outputs.nado == 'true'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: openclaw/wacli
+          ref: ${{ needs.versiya.outputs.tag }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-gcc zip
+          path-type: inherit
+      - name: Сборка
+        env:
+          CGO_ENABLED: "1"
+          GOOS: windows
+          GOARCH: amd64
+          CGO_CFLAGS: "-Wno-error=missing-braces"
+        run: |
+          V="${{ needs.versiya.outputs.tag }}"; V="${V#v}"
+          LD="-s -w -X main.version=$V -X main.releaseLinkerSetting=wacli-release-linker-version=[$V]"
+          go build -trimpath -tags sqlite_fts5 -ldflags "$LD" -o dist/wacli.exe ./cmd/wacli
+      - name: Проверка
+        run: |
+          dist/wacli.exe --version
+          dist/wacli.exe --store "$RUNNER_TEMP/s" doctor
+      - name: Упаковка
+        run: |
+          V="${{ needs.versiya.outputs.tag }}"; V="${V#v}"
+          mkdir -p out && cp LICENSE README.md dist/
+          (cd dist && zip -q "../out/wacli_${V}_windows_amd64.zip" wacli.exe LICENSE README.md)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+
+  windows-arm64:
+    name: Windows ARM64 (необязательно)
+    needs: versiya
+    if: needs.versiya.outputs.nado == 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: openclaw/wacli
+          ref: ${{ needs.versiya.outputs.tag }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+      - name: Сборка через zig
+        env:
+          CGO_ENABLED: "1"
+          GOOS: windows
+          GOARCH: arm64
+          CC: "zig cc -target aarch64-windows-gnu"
+          CXX: "zig c++ -target aarch64-windows-gnu"
+          CGO_CFLAGS: "-Wno-error=missing-braces"
+        run: |
+          V="${{ needs.versiya.outputs.tag }}"; V="${V#v}"
+          LD="-s -w -X main.version=$V -X main.releaseLinkerSetting=wacli-release-linker-version=[$V]"
+          go build -trimpath -tags sqlite_fts5 -ldflags "$LD" -o dist/wacli.exe ./cmd/wacli
+          mkdir -p out && cp LICENSE README.md dist/
+          (cd dist && zip -q "../out/wacli_${V}_windows_arm64.zip" wacli.exe LICENSE README.md)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64
+          path: out/*
+
+  vypusk:
+    name: Выпуск
+    needs: [versiya, mac, windows, windows-arm64]
+    if: always() && needs.versiya.outputs.nado == 'true' && needs.mac.result == 'success' && needs.windows.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: files
+          merge-multiple: true
+      - name: Контрольные суммы
+        run: |
+          cd files && sha256sum * > checksums.txt && cat checksums.txt
+      - name: Публикация
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.versiya.outputs.tag }}"
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" files/* --repo "$GITHUB_REPOSITORY" \
+            --title "wacli $TAG — macOS 12+ и Windows" \
+            --notes "Сборка исходников https://github.com/openclaw/wacli/releases/tag/$TAG (MIT) для AI-секретаря курса Protuz. macOS 12 и новее (универсальный файл), Windows x64, Windows ARM64 (если собрался). Контрольные суммы в checksums.txt."
